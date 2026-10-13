@@ -8,3 +8,4 @@ dist-static
 .impeccable/
 *.mp4
 submission-draft.json
+*.tsbuildinfo
