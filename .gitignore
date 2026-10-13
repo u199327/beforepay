@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-static
+.env*
+!.env.example
+.impeccable/review
+.claude/
+.impeccable/
+*.mp4
+submission-draft.json
