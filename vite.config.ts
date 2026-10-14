@@ -1,4 +1,4 @@
-import { defineConfig, type Plugin, type ViteDevServer } from 'vite'
+import { defineConfig, loadEnv, type Plugin, type ViteDevServer } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -7,7 +7,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
  * Dev-only bridge so `npm run dev` serves the same `api/*.ts` handlers that
  * Vercel deploys as serverless functions (Web-standard Request/Response).
  */
-function devApi(): Plugin {
+function devApi(bindings: Record<string, string>): Plugin {
   return {
     name: 'beforepay-dev-api',
     apply: 'serve',
@@ -17,21 +17,16 @@ function devApi(): Plugin {
         const match = url.pathname.match(/^\/api\/([a-z-]+)$/)
         if (!match) return next()
         try {
-          const mod = await server.ssrLoadModule(`/api/${match[1]}.ts`)
-          const handler = mod[req.method ?? 'GET']
-          if (typeof handler !== 'function') {
-            res.statusCode = 405
-            return res.end()
-          }
+          const mod = await server.ssrLoadModule('/api/router.ts')
           const chunks: Buffer[] = []
           for await (const c of req) chunks.push(c as Buffer)
           const body = chunks.length ? Buffer.concat(chunks) : undefined
-          const request = new Request(`http://localhost${req.url}`, {
+          const request = new Request(`http://${req.headers.host ?? 'localhost'}${req.url}`, {
             method: req.method,
             headers: req.headers as Record<string, string>,
             body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
           })
-          const response: Response = await handler(request)
+          const response: Response = await mod.routeApi(request, bindings)
           res.statusCode = response.status
           response.headers.forEach((v, k) => res.setHeader(k, v))
           res.end(Buffer.from(await response.arrayBuffer()))
@@ -46,8 +41,9 @@ function devApi(): Plugin {
   }
 }
 
-export default defineConfig({
-  plugins: [react(), tailwindcss(), devApi()],
-  build: process.env.SINGLE_FILE ? { assetsInlineLimit: 100_000_000, cssCodeSplit: false } : {},
+export default defineConfig(({ mode }) => ({
+  base: process.env.VITE_BASE_PATH || '/',
+  plugins: [react(), tailwindcss(), devApi(loadEnv(mode, process.cwd(), ''))],
+  build: { target: ['es2020', 'safari14'], ...(process.env.SINGLE_FILE ? { assetsInlineLimit: 100_000_000, cssCodeSplit: false } : {}) },
   test: { include: ['tests/**/*.test.ts'] },
-} as never)
+} as never))

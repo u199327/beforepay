@@ -9,3 +9,14 @@ dist-static
 *.mp4
 submission-draft.json
 *.tsbuildinfo
+
+.qa/
+task_plan.md
+findings.md
+progress.md
+
+.DS_Store
+.openai/
+.sites-runtime/
+.serena/
+.coverage/

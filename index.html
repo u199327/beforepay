@@ -14,7 +14,13 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><section id="boot-status" style="max-width:600px;margin:48px auto;padding:24px;font:18px/1.5 system-ui;color:#101820;background:#f8f9f6"><h1 style="font-size:36px">BeforePay</h1><p id="boot-message">Loading your payment checker…</p><button onclick="location.reload()" style="padding:14px 22px;border:0;border-radius:12px;background:#101820;color:white;font:inherit">Reload app</button></section></div>
+    <script>
+      if (!String.prototype.replaceAll) String.prototype.replaceAll = function (search, replacement) { return this.split(search).join(replacement); };
+      if ('serviceWorker' in navigator) navigator.serviceWorker.getRegistrations().then(function (registrations) { return Promise.all(registrations.filter(function (r) { return (r.active || r.waiting || r.installing) && /\/sw\.js(?:\?|$)/.test((r.active || r.waiting || r.installing).scriptURL); }).map(function (r) { return r.unregister(); })); }).catch(function () {});
+      if ('caches' in window) caches.keys().then(function (keys) { return Promise.all(keys.filter(function (k) { return k.indexOf('beforepay-') === 0; }).map(function (k) { return caches.delete(k); })); }).catch(function () {});
+      setTimeout(function () { var message = document.getElementById('boot-message'); if (message) message.textContent = 'The app could not finish loading. Tap Reload app, or open this link in Safari or Chrome.'; }, 8000);
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

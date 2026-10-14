@@ -1,21 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  ArrowRight, Bookmark, Camera, ClipboardPaste, Download, EyeOff, ImageUp, Link2, Lock, Play, ScanLine, Share, Smartphone, Sparkles, WifiOff,
+  ArrowRight, Bookmark, Camera, ClipboardPaste, Download, EyeOff, ImageUp, Link2, Lock, Play, ScanLine, Share, Smartphone, WifiOff,
 } from 'lucide-react'
+import { BRANDS } from './engine/reference'
 import { DEMOS, type DemoScenario } from './engine/demos'
-import { capabilities, findDemo, readScreenshot, runCheck, runDemo, searchRegistry, type Capabilities } from './engine/client'
+import { capabilities, findDemo, runCheck, runDemo, searchRegistry, type Capabilities } from './engine/client'
 import { parseTarget } from './engine/analyze'
-import type { InputSource, Report, ScreenshotFindings } from './engine/types'
+import type { InputSource, PaymentContext, Report, ScreenshotFindings } from './engine/types'
 import { INGEST_MESSAGES, ingest, shareableTarget, type PaymentUri } from './lib/ingest'
-import { decodeFrame, decodeQrFromFile, toUploadDataUrl } from './qr'
+import { decodeFrame, decodeQrFromFile } from './qr'
+import { readLocalScreenshot } from './lib/ocr'
+import { PaymentDetails } from './PaymentDetails'
 import { Analyzing, ReportView, STEPS } from './Report'
 import { Notice, Sheet, UrlAnatomy, Wordmark } from './ui'
 
 type View =
   | { name: 'home' }
-  | { name: 'confirm'; url: URL; source: InputSource; screenshot?: ScreenshotFindings }
+  | { name: 'confirm'; url: URL; source: InputSource; screenshot?: ScreenshotFindings; expected?: string }
   | { name: 'analyzing'; url: URL }
-  | { name: 'report'; report: Report; raw: URL | null; demo?: DemoScenario }
+  | { name: 'report'; report: Report; raw: URL | null; demo?: DemoScenario; privateContext?: PaymentContext }
+
+const CHECK_ROUTE = `${import.meta.env.BASE_URL}${import.meta.env.VITE_STATIC_HOST === 'true' ? '' : 'check'}`
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const reduced = () => typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -32,6 +37,7 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null)
   const [rechecking, setRechecking] = useState(false)
   const [installEvt, setInstallEvt] = useState<InstallEvent | null>(null)
+  const operation = useRef(0)
 
   useEffect(() => {
     capabilities().then(setCaps)
@@ -65,7 +71,7 @@ export default function App() {
   }, [])
 
   const animateSteps = useCallback(async (work: Promise<unknown>) => {
-    const per = reduced() ? 60 : 520
+    const per = reduced() ? 20 : 180
     for (let i = 0; i < STEPS.length; i++) {
       setStep(i)
       await sleep(per)
@@ -76,20 +82,16 @@ export default function App() {
   }, [])
 
   const startCheck = useCallback(
-    async (url: URL, source: InputSource, opts: { expected?: string; screenshot?: ScreenshotFindings } = {}) => {
+    async (url: URL, source: InputSource, opts: { expected?: string; screenshot?: ScreenshotFindings; context?: PaymentContext } = {}) => {
+      const current = ++operation.current
       setView({ name: 'analyzing', url })
       scrollTo({ top: 0 })
-      const work = runCheck(url, { source, expected: opts.expected, screenshot: opts.screenshot })
+      const work = runCheck(url, { source, ...opts })
       await animateSteps(work)
       const report = await work
-      const qs = new URLSearchParams({ url: shareableTarget(url) })
-      if (opts.expected) qs.set('expect', opts.expected)
-      try {
-        history.replaceState(null, '', `${location.pathname.includes('/check') ? location.pathname : 'check'}?${qs}`)
-      } catch {
-        /* ignore */
-      }
-      setView({ name: 'report', report, raw: url })
+      if (current !== operation.current) return
+      // Keep live payment URLs out of browser history. Sharing explicitly creates a redacted check link.
+      setView({ name: 'report', report, raw: url, privateContext: opts.context })
       if (opts.expected && caps?.registry) {
         searchRegistry(opts.expected).then((registry) => setView((v) => (v.name === 'report' && v.report.id === report.id ? { ...v, report: { ...v.report, registry } } : v)))
       }
@@ -98,13 +100,19 @@ export default function App() {
   )
 
   const startDemo = useCallback(
-    async (demo: DemoScenario) => {
-      go(`check?demo=${demo.id}`)
+    async (demo: DemoScenario, expected?: string, navigate = true) => {
+      if (navigate) {
+        const params = new URLSearchParams({ demo: demo.id })
+        if (expected) params.set('expect', expected)
+        go(`${CHECK_ROUTE}?${params}`)
+      }
       const url = new URL(demo.url)
+      const current = ++operation.current
       setView({ name: 'analyzing', url })
       scrollTo({ top: 0 })
       await animateSteps(Promise.resolve())
-      setView({ name: 'report', report: runDemo(demo), raw: null, demo })
+      if (current !== operation.current) return
+      setView({ name: 'report', report: runDemo(demo, expected), raw: null, demo })
     },
     [animateSteps, go],
   )
@@ -114,52 +122,65 @@ export default function App() {
     const params = new URLSearchParams(location.search)
     const demo = findDemo(params.get('demo'))
     if (demo) {
-      startDemo(demo)
+      startDemo(demo, params.get('expect') ?? undefined)
       return
     }
     const shared = [params.get('url'), params.get('text'), params.get('title')].filter(Boolean).join(' ')
     if (!shared) return
     const r = ingest(shared)
     if (r.ok) {
-      const source: InputSource = location.pathname.includes('share') ? 'share' : 'link'
+      const source: InputSource = location.pathname.includes('share') || params.get('source') === 'share' ? 'share' : 'link'
       if (params.get('auto') === '1') startCheck(r.url, source, { expected: params.get('expect') ?? undefined })
-      else setView({ name: 'confirm', url: r.url, source })
+      else setView({ name: 'confirm', url: r.url, source, expected: params.get('expect') ?? undefined })
     } else flash(INGEST_MESSAGES[r.error])
     // run once on load
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    const onPop = () => setView({ name: 'home' })
+    const onPop = () => {
+      operation.current++
+      setRechecking(false)
+      const params = new URLSearchParams(location.search)
+      const demo = findDemo(params.get('demo'))
+      if (demo) { startDemo(demo, params.get('expect') ?? undefined, false); return }
+      const target = ingest(params.get('url'))
+      setView(target.ok ? { name: 'confirm', url: target.url, source: 'link', expected: params.get('expect') ?? undefined } : { name: 'home' })
+    }
     addEventListener('popstate', onPop)
     return () => removeEventListener('popstate', onPop)
-  }, [])
+  }, [startDemo])
 
   const home = () => {
+    operation.current++
+    setRechecking(false)
     go(location.pathname.includes('/check') || location.pathname.includes('share') ? import.meta.env.BASE_URL : location.pathname)
     setView({ name: 'home' })
   }
 
   const recheckExpected = async (name: string) => {
     if (view.name !== 'report') return
+    const current = ++operation.current
     setRechecking(true)
     try {
       if (view.demo) {
         setView({ ...view, report: runDemo(view.demo, name || undefined) })
       } else if (view.raw) {
-        const report = await runCheck(view.raw, { source: view.report.source, expected: name || undefined, screenshot: view.report.screenshot })
+        const report = await runCheck(view.raw, { source: view.report.source, expected: name || undefined, screenshot: view.report.screenshot, context: view.privateContext })
+        if (current !== operation.current) return
         setView({ ...view, report })
-        if (name && caps?.registry) searchRegistry(name).then((registry) => setView((v) => (v.name === 'report' ? { ...v, report: { ...v.report, registry } } : v)))
+        if (name && caps?.registry) searchRegistry(name).then((registry) => setView((v) => (current === operation.current && v.name === 'report' ? { ...v, report: { ...v.report, registry } } : v)))
       }
     } finally {
-      setRechecking(false)
+      if (current === operation.current) setRechecking(false)
     }
   }
 
   const share = async () => {
     if (view.name !== 'report') return
     const base = `${location.origin}${location.pathname.replace(/(check|share-target)\/?$/, '')}`.replace(/\/?$/, '/')
-    const link = view.demo ? `${base}check?demo=${view.demo.id}` : `${base}check?url=${encodeURIComponent(shareableTarget(view.raw!))}`
+    const params = new URLSearchParams(view.demo ? { demo: view.demo.id } : { url: shareableTarget(view.raw!) })
+    const link = `${base}${import.meta.env.VITE_STATIC_HOST === 'true' ? '' : 'check'}?${params}`
     try {
       await navigator.clipboard.writeText(link)
       flash('Link copied — session tokens removed')
@@ -176,8 +197,8 @@ export default function App() {
         </div>
       )}
       {view.name === 'home' && <Home caps={caps} installEvt={installEvt} onCheck={startCheck} onDemo={startDemo} onConfirm={(url, source, screenshot) => setView({ name: 'confirm', url, source, screenshot })} flash={flash} />}
-      {view.name === 'confirm' && <Confirm url={view.url} source={view.source} onCancel={home} onGo={(expected) => startCheck(view.url, view.source, { expected, screenshot: view.screenshot })} />}
-      {view.name === 'analyzing' && <Analyzing url={parseTarget(view.url)} step={step} threatConfigured={Boolean(caps?.threat) || view.url.href.includes('stripe.com/c/pay/cs_live_b1North') || DEMOS.some((d) => d.url === view.url.href)} />}
+      {view.name === 'confirm' && <Confirm url={view.url} source={view.source} initialExpected={view.expected} onCancel={home} onGo={(url, expected, context) => startCheck(url, view.source, { expected, context, screenshot: view.screenshot })} />}
+      {view.name === 'analyzing' && <Analyzing url={parseTarget(view.url)} step={step} onCancel={home} threatConfigured={Boolean(caps?.threat) || view.url.href.includes('stripe.com/c/pay/cs_live_b1North') || DEMOS.some((d) => !d.id.startsWith('paypal') && d.url === view.url.href)} />}
       {view.name === 'report' && <ReportView report={view.report} onBack={home} onExpected={recheckExpected} onShare={share} rechecking={rechecking} />}
       {toast && (
         <div className="fixed inset-x-0 bottom-0 z-[60] flex justify-center p-4 safe-bottom" role="status">
@@ -190,9 +211,13 @@ export default function App() {
 
 /* ------------------------------------------------------------------ */
 
-function Confirm({ url, source, onCancel, onGo }: { url: URL; source: InputSource; onCancel: () => void; onGo: (expected?: string) => void }) {
-  const p = parseTarget(url)
-  const [expected, setExpected] = useState('')
+function Confirm({ url, source, initialExpected, onCancel, onGo }: { url: URL; source: InputSource; initialExpected?: string; onCancel: () => void; onGo: (url: URL, expected?: string, context?: PaymentContext) => void }) {
+  const [expected, setExpected] = useState(initialExpected ?? '')
+  const [context, setContext] = useState<PaymentContext>({})
+  const [edited, setEdited] = useState(url.href)
+  const [error, setError] = useState('')
+  const editedTarget = ingest(edited)
+  const p = parseTarget(editedTarget.ok ? editedTarget.url : url)
   const from = { share: 'Shared to BeforePay', link: 'Opened from a BeforePay link', qr: 'Read from a QR code', screenshot: 'Found in your screenshot', paste: 'Pasted', demo: 'Simulation' }[source]
   return (
     <div>
@@ -211,13 +236,14 @@ function Confirm({ url, source, onCancel, onGo }: { url: URL; source: InputSourc
           className="mt-6"
           onSubmit={(e) => {
             e.preventDefault()
-            onGo(expected.trim() || undefined)
+            const result = ingest(edited)
+            if (!result.ok) { setError(INGEST_MESSAGES[result.error]); return }
+            onGo(result.url, expected.trim() || undefined, context)
           }}
         >
-          <label htmlFor="cexp" className="text-[16px] font-semibold">
-            Who are you expecting to pay? <span className="font-normal text-mute">Optional</span>
-          </label>
-          <input id="cexp" value={expected} onChange={(e) => setExpected(e.target.value)} maxLength={80} placeholder="e.g. the parking operator on the sign" className="mt-2 h-14 w-full rounded-2xl border border-line bg-card px-4 text-[17px] outline-none focus:border-ink" />
+          {source === 'screenshot' && <div><label htmlFor="read-link" className="block text-[16px] font-semibold">Review the link we read</label><input id="read-link" value={edited} onChange={e => setEdited(e.target.value)} aria-describedby="read-link-help" spellCheck={false} autoCapitalize="off" className="mt-2 min-h-14 w-full min-w-0 rounded-xl border border-line bg-card px-4 text-[16px] font-normal" /><p id="read-link-help" className="mt-2 text-[14px] text-mute">Compare it with your screenshot. Correct any reading errors before checking.</p></div>}
+          {error && <p role="alert" className="mt-3 text-red">{error}</p>}
+          <PaymentDetails expected={expected} onExpected={setExpected} context={context} onContext={setContext} />
           <div className="mt-6 flex flex-col gap-3 sm:flex-row">
             <button autoFocus className="inline-flex h-14 items-center justify-center gap-2 rounded-2xl bg-ink px-7 text-[17px] font-semibold text-paper hover:bg-ink-3">
               Check payment <ArrowRight size={19} />
@@ -235,7 +261,7 @@ function Confirm({ url, source, onCancel, onGo }: { url: URL; source: InputSourc
 function Header({ right }: { right?: React.ReactNode }) {
   return (
     <header className="safe-x mx-auto flex max-w-[1240px] items-center justify-between py-5">
-      <a href="./" aria-label="BeforePay home" className="rounded-lg">
+      <a href={import.meta.env.BASE_URL} aria-label="BeforePay home" className="rounded-lg">
         <Wordmark />
       </a>
       {right}
@@ -248,7 +274,7 @@ function Header({ right }: { right?: React.ReactNode }) {
 interface HomeProps {
   caps: Capabilities | null
   installEvt: InstallEvent | null
-  onCheck: (url: URL, source: InputSource) => void
+  onCheck: (url: URL, source: InputSource, opts?: { expected?: string; context?: PaymentContext }) => void
   onDemo: (d: DemoScenario) => void
   onConfirm: (url: URL, source: InputSource, screenshot?: ScreenshotFindings) => void
   flash: (m: string) => void
@@ -256,11 +282,16 @@ interface HomeProps {
 
 function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps) {
   const [value, setValue] = useState('')
+  const [expected, setExpected] = useState('')
+  const [context, setContext] = useState<PaymentContext>({})
   const [error, setError] = useState<string | null>(null)
   const [paymentUri, setPaymentUri] = useState<PaymentUri | null>(null)
   const [scanOpen, setScanOpen] = useState(false)
   const [installOpen, setInstallOpen] = useState(false)
-  const [upload, setUpload] = useState<{ file: File; preview: string; state: 'decoding' | 'noqr' | 'reading' | 'error' | 'nourl'; message?: string; findings?: ScreenshotFindings } | null>(null)
+  const [upload, setUpload] = useState<{ file: File; preview: string; state: 'decoding' | 'noqr' | 'reading' | 'error' | 'nourl'; message?: string; findings?: ScreenshotFindings; links?: string[] } | null>(null)
+  const ocrAbort = useRef<AbortController | null>(null)
+  const uploadOperation = useRef(0)
+  useEffect(() => () => { ocrAbort.current?.abort() }, [])
   const fileRef = useRef<HTMLInputElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const canPaste = typeof navigator !== 'undefined' && Boolean(navigator.clipboard?.readText)
@@ -270,7 +301,7 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
     const r = ingest(text)
     if (r.ok) {
       setError(null)
-      onCheck(r.url, source)
+      onCheck(r.url, source, { expected: expected.trim() || undefined, context: { ...context, message: context.message || (text.trim() !== r.url.href && /\s/.test(text.trim()) ? text.slice(0, 2000) : undefined) } })
     } else {
       setError(INGEST_MESSAGES[r.error])
       if (r.paymentUri) setPaymentUri(r.paymentUri)
@@ -302,32 +333,37 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
     if (!file) return
     if (!file.type.startsWith('image/')) return flash('Choose an image (PNG, JPG or WebP).')
     if (file.size > 15_000_000) return flash('That image is over 15 MB. Try a smaller screenshot.')
+    const current = ++uploadOperation.current
     const preview = URL.createObjectURL(file)
     setUpload({ file, preview, state: 'decoding' })
     try {
       const qr = await decodeQrFromFile(file)
+      if (current !== uploadOperation.current) { URL.revokeObjectURL(preview); return }
       if (qr) {
         setUpload(null)
         URL.revokeObjectURL(preview)
         fromDecoded(qr, 'qr')
       } else setUpload({ file, preview, state: 'noqr' })
     } catch {
+      if (current !== uploadOperation.current) { URL.revokeObjectURL(preview); return }
       setUpload({ file, preview, state: 'error', message: "We couldn't open that image." })
     }
   }
 
-  const readWithAi = async () => {
+  const readOnDevice = async () => {
     if (!upload) return
+    const current = upload
+    ocrAbort.current?.abort()
+    const controller = new AbortController()
+    ocrAbort.current = controller
     setUpload({ ...upload, state: 'reading' })
-    const res = await readScreenshot(await toUploadDataUrl(upload.file))
-    if (res.status === 'ok' && res.findings) {
-      const link = res.findings.paymentUrl ? ingest(res.findings.paymentUrl) : null
-      if (link?.ok) {
-        URL.revokeObjectURL(upload.preview)
-        setUpload(null)
-        onConfirm(link.url, 'screenshot', res.findings)
-      } else setUpload({ ...upload, state: 'nourl', findings: res.findings })
-    } else setUpload({ ...upload, state: 'error', message: res.status === 'not_configured' ? 'AI reading is not configured on this deployment.' : res.reason })
+    const timeout = setTimeout(() => controller.abort(), 60_000)
+    try {
+      const res = await readLocalScreenshot(current.file, message => setUpload(v => v?.preview === current.preview ? { ...v, message } : v), controller.signal)
+      if (!controller.signal.aborted) setUpload({ ...current, state: 'nourl', findings: res.findings, links: res.links })
+    } catch {
+      if (ocrAbort.current === controller) setUpload(v => v?.preview === current.preview ? { ...v, state: 'error', message: 'The image could not be read. Try a sharper crop or paste the link instead.' } : v)
+    } finally { clearTimeout(timeout) }
   }
 
   return (
@@ -348,7 +384,7 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
           <div className="min-w-0 lg:col-span-7">
             <h1 className="rise text-[clamp(3.1rem,9.5vw,6rem)] leading-[0.92] font-extrabold tracking-[-0.05em] text-balance">Know before you&nbsp;pay.</h1>
             <p className="rise mt-5 max-w-[30ch] text-[20px] leading-snug text-ink/75 sm:text-[23px]" style={{ animationDelay: '60ms' }}>
-              Find out who's behind a payment, before your money leaves.
+              Check a payment link, understand the warning signs and know what to do next.
             </p>
 
             <form
@@ -392,6 +428,8 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
               <button className="mt-3 inline-flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-ink text-[17px] font-semibold text-paper sm:hidden">
                 Check payment <ArrowRight size={19} />
               </button>
+              <PaymentDetails expected={expected} onExpected={setExpected} context={context} onContext={setContext} />
+              {caps?.threat && <p className="mt-3 text-[13px] text-mute">Known-threat checks send the link to Google. Screenshots are read on your device.</p>}
               {error && (
                 <p id="url-error" className="mt-3 text-[15px] font-medium text-red" role="alert">
                   {error}
@@ -417,6 +455,13 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
               </button>
               <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => { onFile(e.target.files?.[0]); e.target.value = '' }} />
             </div>
+            <div className="mt-5">
+              <p className="text-[14px] font-semibold text-mute">Try an address check</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {REAL_EXAMPLES.map(example => <button key={example.label} onClick={() => { setValue(example.url); submit(example.url) }} className="min-h-11 rounded-full bg-paper-2 px-4 text-[14px] font-semibold hover:bg-line">{example.label}</button>)}
+              </div>
+              <p className="mt-2 text-[13px] text-mute">The same rules run on your own links. The brand-trick address is illustrative.</p>
+            </div>
             <p className="rise mt-6 flex items-start gap-2 text-[15px] text-mute" style={{ animationDelay: '220ms' }}>
               <Smartphone size={17} className="mt-0.5 shrink-0" />
               <span>
@@ -428,16 +473,16 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
 
           <aside className="on-dark rise min-w-0 self-start rounded-[28px] bg-ink p-5 text-paper sm:p-7 lg:col-span-5 lg:mt-3" style={{ animationDelay: '140ms' }} aria-labelledby="sims">
             <h2 id="sims" className="text-[22px] font-bold tracking-[-0.03em]">Try a simulation</h2>
-            <p className="mt-1 text-[15px] text-mute-dark">Fictional merchants with simulated registry data. Works offline.</p>
+            <p className="mt-1 text-[15px] text-mute-dark">Three PayPal examples. Address checks run for real on your device.</p>
             <ul className="mt-5 grid grid-cols-[minmax(0,1fr)] gap-2">
-              {DEMOS.map((d) => (
+              {DEMOS.filter((d) => d.id.startsWith('paypal')).sort((a, b) => a.id === 'paypal' ? -1 : b.id === 'paypal' ? 1 : 0).map((d) => (
                 <li key={d.id}>
                   <button onClick={() => onDemo(d)} className="group flex w-full items-center gap-4 rounded-2xl border border-line-dark p-4 text-left transition-colors hover:border-lime hover:bg-ink-2">
                     <div className="min-w-0 flex-1">
                       <p className="text-[12px] font-semibold text-lime">{d.label}</p>
                       <p className="mt-0.5 text-[18px] font-bold tracking-[-0.02em]">{d.title}</p>
                       <p className="mt-1 text-[14px] leading-snug text-mute-dark">{d.blurb}</p>
-                      <p className="mt-2 truncate font-mono text-[12px] text-paper/60">{new URL(d.url).hostname}{new URL(d.url).pathname.slice(0, 18)}…</p>
+                      <p className="mt-2 truncate font-mono text-[12px] text-paper/60">{d.url}</p>
                     </div>
                     <span className="grid size-11 shrink-0 place-items-center rounded-full bg-lime text-ink transition-transform group-hover:translate-x-0.5">
                       <Play size={17} fill="currentColor" />
@@ -460,40 +505,24 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
 
       <Scanner open={scanOpen} onClose={() => setScanOpen(false)} onResult={(t) => { setScanOpen(false); fromDecoded(t, 'qr') }} onUpload={() => { setScanOpen(false); fileRef.current?.click() }} />
       <InstallSheet open={installOpen} onClose={() => setInstallOpen(false)} />
-      <Sheet open={Boolean(upload)} onClose={() => { if (upload) URL.revokeObjectURL(upload.preview); setUpload(null) }} title="Your screenshot">
+      <Sheet open={Boolean(upload)} onClose={() => { uploadOperation.current++; ocrAbort.current?.abort(); ocrAbort.current = null; if (upload) URL.revokeObjectURL(upload.preview); setUpload(null) }} title="Your screenshot">
         {upload && (
           <div className="grid gap-4 pb-2">
             <img src={upload.preview} alt="Uploaded screenshot preview" className="max-h-56 w-full rounded-2xl border border-line bg-paper-2 object-contain" />
             {upload.state === 'decoding' && <p className="text-[16px]">Looking for a QR code on your device…</p>}
-            {upload.state === 'reading' && <p className="text-[16px]">Reading the screenshot with AI…</p>}
+            {upload.state === 'reading' && <p className="text-[16px]" role="status">{upload.message ?? 'Reading the screenshot on your device…'}</p>}
             {upload.state === 'error' && <Notice tone="error">{upload.message}</Notice>}
             {(upload.state === 'noqr' || upload.state === 'error') && (
               <>
                 <p className="text-[16px] font-semibold">No QR code found in this image.</p>
-                {caps?.ai ? (
-                  <>
-                    <Notice icon={<EyeOff size={18} />}>
-                      Crop out or cover card numbers, account details and addresses first. The image is sent once to read the payment details, then discarded.
-                    </Notice>
-                    <button onClick={readWithAi} className="inline-flex h-13 items-center justify-center gap-2 rounded-2xl bg-ink py-3.5 text-[16px] font-semibold text-paper">
-                      <Sparkles size={18} /> Read payment details with AI
-                    </button>
-                  </>
-                ) : (
-                  <Notice tone="warn">
-                    Reading screenshots with AI isn't configured on this deployment, so the image stays on your device. Copy the payment link from the page and paste it instead.
-                  </Notice>
-                )}
+                <Notice icon={<EyeOff size={18} />}>Your image stays on your device. The reader downloads once; a clear crop of the link works best.</Notice>
+                <button onClick={readOnDevice} className="inline-flex min-h-13 items-center justify-center gap-2 rounded-2xl bg-ink py-3.5 text-[16px] font-semibold text-paper"><ScanLine size={18} /> Read link from screenshot</button>
               </>
             )}
             {upload.state === 'nourl' && upload.findings && (
               <>
-                <Notice tone="warn">We couldn't see a full web address in the screenshot. Paste the link to check where the payment goes.</Notice>
-                <ul className="grid gap-1 text-[15px]">
-                  {upload.findings.visibleMerchant && <li>Name shown: <strong>{upload.findings.visibleMerchant}</strong> (not verified)</li>}
-                  {upload.findings.amount && <li>Amount shown: {upload.findings.amount}</li>}
-                  {upload.findings.suspicious.map((s) => <li key={s} className="text-red">{s}</li>)}
-                </ul>
+                {upload.links?.length ? <><p className="text-[16px] font-semibold">Choose the link to review</p><p className="text-[14px] text-mute">Text recognition can make mistakes. You can correct the link on the next screen.</p><div className="grid gap-2">{upload.links.map(link => <button key={link} onClick={() => { const r = ingest(link); if (r.ok) { URL.revokeObjectURL(upload.preview); setUpload(null); onConfirm(r.url, 'screenshot', upload.findings) } }} className="min-h-12 rounded-xl border border-line bg-card p-3 text-left font-mono text-[14px] break-all hover:border-ink">{parseTarget(new URL(link)).href}</button>)}</div></> : <Notice tone="warn">We couldn't read a full web address. Crop more closely around the link, or copy and paste it instead.</Notice>}
+                <button onClick={() => { URL.revokeObjectURL(upload.preview); setUpload(null); inputRef.current?.focus() }} className="min-h-12 rounded-xl bg-paper-2 px-4 text-[15px] font-semibold">Paste a link instead</button>
               </>
             )}
           </div>
@@ -502,6 +531,13 @@ function Home({ caps, installEvt, onCheck, onDemo, onConfirm, flash }: HomeProps
     </div>
   )
 }
+
+const REAL_EXAMPLES = [
+  { label: 'PayPal checkout', url: 'https://www.paypal.com/checkoutnow' },
+  { label: 'Stripe payment', url: 'https://buy.stripe.com/' },
+  { label: 'Brand trick', url: 'https://paypal.com@payments.example/pay' },
+  { label: 'Hidden destination', url: 'https://bit.ly/payment-example' },
+]
 
 function Steps() {
   const steps = [
@@ -559,11 +595,12 @@ function HowItWorks({ caps }: { caps: Capabilities | null }) {
   const state = (on: boolean | undefined, label = 'Live') => (caps === null ? 'Checking…' : on ? label : 'Not configured')
   const rows: [string, string, boolean][] = [
     ['Address & domain structure', 'Always on', true],
-    ['Brand impersonation (36 brands)', 'Always on', true],
+    [`Brand resemblance (${BRANDS.length} brands)`, 'Always on', true],
     ['Payment processor recognition', 'Always on', true],
-    ['Domain registration date (RDAP)', 'Live', true],
+    ['Domain registration date (RDAP)', 'Live lookup', true],
+    ['Public DNS availability', 'Live lookup', true],
     ['Phishing & malware databases', state(caps?.threat, 'Google Safe Browsing'), Boolean(caps?.threat)],
-    ['Screenshot reading (AI)', state(caps?.ai, 'OpenAI'), Boolean(caps?.ai)],
+    ['Screenshot text reading', 'On your device', true],
     ['UK company register', state(caps?.registry, 'Companies House'), Boolean(caps?.registry)],
   ]
   return (
@@ -587,10 +624,10 @@ function HowItWorks({ caps }: { caps: Capabilities | null }) {
         <h2 className="text-[32px] leading-tight font-extrabold tracking-[-0.04em]">Private by design</h2>
         <ul className="mt-6 grid gap-5 text-[16px] leading-snug">
           <li><strong className="font-bold">We never open your link.</strong> No page is visited and no payment is started — we only read the address.</li>
-          <li><strong className="font-bold">Nothing is stored.</strong> No accounts, no history. Checks live only in this tab.</li>
+          <li><strong className="font-bold">No saved check history.</strong> No accounts. Your report lives in this tab; optional threat lookups use a temporary cache.</li>
           <li><strong className="font-bold">Tokens are stripped.</strong> Session IDs, emails and card-like numbers are hidden from reports and shared links.</li>
-          <li><strong className="font-bold">QR codes are read on your device.</strong> A screenshot only leaves your phone if you choose AI reading.</li>
-          <li><strong className="font-bold">Lookups we make.</strong> The domain name goes to the public registry (RDAP); the link goes to a threat database only when one is configured.</li>
+          <li><strong className="font-bold">Images stay on your device.</strong> QR decoding and screenshot text reading happen locally. Review any extracted link before checking it.</li>
+          <li><strong className="font-bold">Lookups we make.</strong> The domain name goes to the public registry (RDAP), and the hostname to Cloudflare's public DNS resolver; the link goes to a threat database only when one is configured.</li>
         </ul>
       </div>
     </section>
@@ -602,6 +639,8 @@ function HowItWorks({ caps }: { caps: Capabilities | null }) {
 function Scanner({ open, onClose, onResult, onUpload }: { open: boolean; onClose: () => void; onResult: (t: string) => void; onUpload: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [err, setErr] = useState<string | null>(null)
+  const resultRef = useRef(onResult)
+  resultRef.current = onResult
   useEffect(() => {
     if (!open) return
     setErr(null)
@@ -629,7 +668,7 @@ function Scanner({ open, onClose, onResult, onUpload }: { open: boolean; onClose
             const found = decodeFrame(v, canvas)
             if (found) {
               navigator.vibrate?.(30)
-              return onResult(found)
+              return resultRef.current(found)
             }
           }
           raf = requestAnimationFrame(tick)
@@ -650,7 +689,7 @@ function Scanner({ open, onClose, onResult, onUpload }: { open: boolean; onClose
       cancelAnimationFrame(raf)
       stream?.getTracks().forEach((t) => t.stop())
     }
-  }, [open, onResult])
+  }, [open])
 
   return (
     <Sheet open={open} onClose={onClose} title="Scan a QR code" dark>

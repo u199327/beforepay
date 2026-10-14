@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { analyze, checkBrands, parseTarget } from '../src/engine/analyze'
 import { DEMOS } from '../src/engine/demos'
-import { ingest, redactUrl } from '../src/lib/ingest'
+import { ingest, redactUrl, shareableTarget } from '../src/lib/ingest'
 import type { Externals } from '../src/engine/types'
 
 const none: Externals = { rdap: { status: 'unavailable' }, threat: { status: 'not_configured' } }
@@ -112,5 +112,24 @@ describe('demo scenarios', () => {
   })
   it('never fills the recipient in any demo', () => {
     for (const d of DEMOS) expect(runDemo(d.id).chain.find((n) => n.role === 'recipient')?.value).toBeNull()
+  })
+})
+
+// Regression checks for demo sharing and malformed input.
+describe('demo deployment regressions', () => {
+  it('does not reinterpret unsupported schemes as HTTPS links', () => {
+    for (const text of ['ftp://paypal.com/file', 'mailto:sam@example.com', 'tel:123456789']) {
+      expect(ingest(text)).toMatchObject({ ok: false, error: 'unsupported_scheme' })
+    }
+    expect(ingest('example.com:8443/pay').ok).toBe(true)
+  })
+  it('hides personal credentials in reports and shared targets', () => {
+    const url = new URL('https://sam%40example.com:password@shop.example.com/pay?token=secret&item=sofa')
+    expect(redactUrl(url).href).not.toContain('sam')
+    expect(redactUrl(url).href).not.toContain('password')
+    expect(shareableTarget(url)).not.toContain('sam')
+    expect(parseTarget(url).credentialText).toBe('•••')
+    expect(shareableTarget(url)).toContain('item=sofa')
+    expect(parseTarget(new URL('https://paypal.com@shop.example.com')).credentialText).toBe('paypal.com')
   })
 })
