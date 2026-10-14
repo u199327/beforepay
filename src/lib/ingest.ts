@@ -11,6 +11,7 @@ export type IngestError =
   | 'unsupported_scheme'
   | 'too_long'
   | 'payment_uri'
+  | 'multiple_links'
 
 export interface PaymentUri {
   scheme: string
@@ -26,7 +27,7 @@ export type IngestResult =
 
 const URL_IN_TEXT = /\bhttps?:\/\/[^\s<>"'`]+/i
 const WWW_IN_TEXT = /\bwww\.[^\s<>"'`]+/i
-const BARE_DOMAIN = /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?::\d{2,5})?(?:\/[^\s<>"'`]*)?/i
+const BARE_DOMAIN = /(?:[\p{L}\p{N}](?:[\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?\.)+[\p{L}]{2,24}(?::\d{2,5})?(?:[/?#][^\s<>"'`]*)?/iu
 const PAYMENT_SCHEME = /^(upi|bitcoin|ethereum|litecoin|lightning|solana|tron|bitcoincash):/i
 const UNSAFE_SCHEME = /^(javascript|data|file|vbscript|blob|about|chrome|intent|content):/i
 
@@ -80,8 +81,10 @@ export function ingest(input: string | null | undefined): IngestResult {
   if (PAYMENT_SCHEME.test(text)) {
     return { ok: false, error: 'payment_uri', paymentUri: parsePaymentUri(text) }
   }
-  if (UNSAFE_SCHEME.test(text)) return { ok: false, error: 'unsupported_scheme' }
+  if (UNSAFE_SCHEME.test(text) || (/^[a-z][a-z0-9+.-]*:/i.test(text) && !/^https?:\/\//i.test(text) && !/^[a-z0-9-]+\.[a-z]/i.test(text))) return { ok: false, error: 'unsupported_scheme' }
 
+  const links = [...text.matchAll(/\bhttps?:\/\/[^\s<>"'`]+/gi)].map(m => trimTrailing(m[0]))
+  if (new Set(links).size > 1) return { ok: false, error: 'multiple_links' }
   let candidate: string | null = null
   const explicit = text.match(URL_IN_TEXT)
   if (explicit) candidate = explicit[0]
@@ -123,6 +126,7 @@ export const INGEST_MESSAGES: Record<IngestError, string> = {
   unsupported_scheme: 'Only web links (http or https) can be checked. Other link types are blocked for your safety.',
   too_long: 'That link is unusually long. Copy just the web address and try again.',
   payment_uri: 'This is a direct payment instruction, not a web page.',
+  multiple_links: 'This message contains more than one link. Paste only the payment link you want to check.',
 }
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +175,10 @@ export function redactUrl(url: URL): Redacted {
   })
   if (url.hash && url.hash.length > 1) count++
   const path = segments.join('/') + (params.length ? `?${params.join('&')}` : '')
-  const auth = url.username ? `${url.username}${url.password ? ':' + HIDDEN : ''}@` : ''
+  const username = redactUsername(url.username)
+  if (username !== url.username) count++
+  if (url.password) count++
+  const auth = url.username || url.password ? `${username}${url.password ? ':' + HIDDEN : ''}@` : ''
   const port = url.port ? `:${url.port}` : ''
   return { href: `${url.protocol}//${auth}${url.hostname}${port}${path}`, path, count }
 }
@@ -180,6 +187,13 @@ export function redactUrl(url: URL): Redacted {
 export function shareableTarget(url: URL): string {
   const { path } = redactUrl(url)
   // Keep a deceptive "user@" prefix (it is evidence), never a password.
-  const auth = url.username ? `${url.username}@` : ''
+  const auth = url.username || url.password ? `${redactUsername(url.username) || 'x'}@` : ''
   return `${url.protocol}//${auth}${url.host}${path}`.replaceAll(HIDDEN, 'x')
+}
+
+/** Keep brand decoys, but hide personal information in credentials. */
+export function redactUsername(username: string): string {
+  let decoded = username
+  try { decoded = decodeURIComponent(username) } catch { /* keep raw */ }
+  return EMAILISH.test(decoded) || TOKENISH.test(decoded) || DIGITS_LONG.test(decoded) ? HIDDEN : username
 }

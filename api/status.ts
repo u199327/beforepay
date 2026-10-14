@@ -1,13 +1,14 @@
-import { env, json } from './_lib/http'
+import { env, json, type Bindings } from './_lib/http'
 
 /** Which optional integrations this deployment has credentials for. Never returns the keys. */
-export function GET() {
+export function GET(_req?: Request, bindings?: Bindings) {
   return json({
     server: true,
-    ai: Boolean(env('OPENAI_API_KEY')),
-    threat: Boolean(env('GOOGLE_SAFE_BROWSING_KEY')),
-    registry: Boolean(env('COMPANIES_HOUSE_API_KEY')),
+    ai: false,
+    threat: Boolean(env('GOOGLE_WEB_RISK_KEY', bindings) || env('GOOGLE_SAFE_BROWSING_KEY', bindings)),
+    threatProvider: env('GOOGLE_WEB_RISK_KEY', bindings) ? 'Google Web Risk' : 'Google Safe Browsing v5',
+    registry: Boolean(env('COMPANIES_HOUSE_API_KEY', bindings)),
     rdap: true,
-    expand: true,
+    expand: false,
   })
 }

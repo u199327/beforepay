@@ -6,8 +6,9 @@ export const json = (data: unknown, status = 200, extra: Record<string, string> 
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...extra },
   })
 
-export const env = (name: string): string | undefined => {
-  const v = process.env[name]
+export type Bindings = Record<string, string | undefined>
+export const env = (name: string, bindings?: Bindings): string | undefined => {
+  const v = bindings?.[name] ?? (typeof process !== 'undefined' ? process.env[name] : undefined)
   return v && v.trim() ? v.trim() : undefined
 }
 
@@ -57,7 +58,7 @@ export async function guardedFetch(
 /** Minimal per-instance rate limit; serverless instances are short-lived, this just blunts bursts. */
 const hits = new Map<string, number[]>()
 export function rateLimited(req: Request, limit = 30, windowMs = 60_000): boolean {
-  const key = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'anon'
+  const key = req.headers.get('cf-connecting-ip') || req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'anon'
   const now = Date.now()
   const list = (hits.get(key) ?? []).filter((t) => now - t < windowMs)
   list.push(now)

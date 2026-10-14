@@ -1,6 +1,8 @@
 import { parse as parseDomain } from 'tldts'
 import { toUnicode } from 'punycode'
-import { redactUrl } from '../lib/ingest'
+import { buildCriteria, ENGINE_VERSION } from './criteria'
+import { contextChecks } from './context'
+import { redactUrl, redactUsername } from '../lib/ingest'
 import {
   BRANDS,
   COMMERCE_PLATFORMS,
@@ -21,6 +23,7 @@ import type {
   Field,
   InputSource,
   ParsedUrl,
+  PaymentContext,
   ProcessorMatch,
   Report,
   ScreenshotFindings,
@@ -61,7 +64,7 @@ export function parseTarget(url: URL): ParsedUrl {
     isPrivateSuffix: Boolean(info.isPrivate),
     path: redacted.path || '/',
     hasCredentials: Boolean(url.username || url.password),
-    credentialText: url.username ? decodeSafe(url.username).slice(0, 80) : null,
+    credentialText: url.username ? decodeSafe(redactUsername(url.username)).slice(0, 80) : url.password ? '•••' : null,
     redactions: redacted.count,
   }
 }
@@ -97,6 +100,7 @@ export interface Impersonation {
   brand: Brand
   how: 'subdomain-trick' | 'homoglyph' | 'name' | 'lookalike' | 'tld-swap'
   detail: string
+  strength?: 'strong' | 'similarity'
 }
 
 export interface BrandResult {
@@ -106,6 +110,7 @@ export interface BrandResult {
 }
 
 function isOfficialFor(brand: Brand, host: string): boolean {
+  if (host.endsWith('.myshopify.com')) return false
   return brand.official.some((d) => host === d || host.endsWith(`.${d}`))
 }
 
@@ -114,7 +119,7 @@ function labelHits(brand: Brand, labels: string[], folded: boolean): string | nu
     const words = label.split('-').filter(Boolean)
     const joined = words.join('')
     for (const token of brand.tokens) {
-      if (words.includes(token)) return label
+      if (words.includes(token) && (brand.distinctive || words.some((w) => CONTEXT_WORDS.includes(w)))) return label
       if (brand.distinctive && joined.includes(token)) return label
       if (joined !== token && joined.startsWith(token)) {
         const rest = joined.slice(token.length)
@@ -137,7 +142,7 @@ export function checkBrands(parsed: ParsedUrl, extraBrands: Brand[] = []): Brand
   const brands = [...extraBrands, ...BRANDS]
   const host = parsed.hostname
   const official = brands.find((b) => isOfficialFor(b, host)) ?? null
-  if (official || parsed.isIp) return { official, impersonation: null, checked: brands.length }
+  if (official || parsed.isIp || parsed.publicSuffix === 'myshopify.com') return { official, impersonation: null, checked: brands.length }
 
   const asciiLabels = host.split('.')
   const unicodeLabels = parsed.displayHost.split('.')
@@ -165,8 +170,8 @@ export function checkBrands(parsed: ParsedUrl, extraBrands: Brand[] = []): Brand
   }
   for (const brand of brands) {
     // 2. International characters that imitate a brand (pаypal with a Cyrillic "а").
-    if (hasIdn) {
-      const hit = labelHits(brand, unicodeLabels.map((l) => foldConfusables(l)), false)
+    if (hasIdn && unicodeLabels.some((l, i) => foldConfusables(l) !== l && foldConfusables(l) !== asciiLabels[i])) {
+      const hit = labelHits(brand, unicodeLabels.filter(l => foldConfusables(l) !== l).map(l => foldConfusables(l)), false)
       if (hit) {
         return {
           official: null,
@@ -183,7 +188,7 @@ export function checkBrands(parsed: ParsedUrl, extraBrands: Brand[] = []): Brand
   for (const brand of brands) {
     // 3a. Exactly the brand's name on another ending ("paypal.co").
     const swap = brand.official.find((d) => d.split('.')[0] === sld && d.split('.')[0].length >= 4)
-    if (swap) {
+    if (swap && brand.tokens.includes(sld)) {
       return {
         official: null,
         checked: brands.length,
@@ -205,7 +210,8 @@ export function checkBrands(parsed: ParsedUrl, extraBrands: Brand[] = []): Brand
         impersonation: {
           brand,
           how: 'name',
-          detail: `Uses the name "${brand.name}" in "${hit}", but ${parsed.registrableDomain ?? parsed.hostname} is not one of ${brand.name}'s domains.`,
+          strength: asciiLabels.some((l) => l.split('-').some((w) => CONTEXT_WORDS.includes(w))) || CONTEXT_WORDS.some((w) => brand.tokens.some(token => hit.replaceAll(token, '').replaceAll('-', '').startsWith(w))) ? 'strong' : 'similarity',
+          detail: `Uses the name "${brand.name}" in "${hit}", but ${parsed.registrableDomain ?? parsed.hostname} is not on our ${brand.name} reference list.`,
         },
       }
     }
@@ -234,7 +240,7 @@ export function checkBrands(parsed: ParsedUrl, extraBrands: Brand[] = []): Brand
         return {
           official: null,
           checked: brands.length,
-          impersonation: { brand, how: 'lookalike', detail: `"${parsed.registrableDomain}" is one or two letters away from ${d}.` },
+          impersonation: { brand, how: 'lookalike', strength: 'similarity', detail: `"${parsed.registrableDomain}" is one or two letters away from ${d}. Similar spelling alone does not prove impersonation.` },
         }
       }
     }
@@ -277,14 +283,14 @@ export function distinctiveWords(name: string): string[] {
 }
 
 function hostMentions(host: string, word: string): boolean {
-  return host.replace(/[-.]/g, '').includes(word)
+  return host.split(/[.-]/).some((label) => label === word || label.replace(/-/g, '') === word)
 }
 
 function findBrandByName(name: string, brands: Brand[]): Brand | null {
   const n = foldConfusables(name).replace(/[^a-z0-9]+/g, '')
   return (
     brands.find((b) => b.name.toLowerCase().replace(/[^a-z0-9]+/g, '') === n) ??
-    brands.find((b) => b.tokens.some((t) => n === t || (t.length >= 5 && n.startsWith(t)))) ??
+    brands.find((b) => b.tokens.some((t) => n === t)) ??
     null
   )
 }
@@ -296,6 +302,7 @@ function findBrandByName(name: string, brands: Brand[]): Brand | null {
 export interface AnalyzeOptions {
   source: InputSource
   expected?: string
+  context?: PaymentContext
   screenshot?: ScreenshotFindings
   extraBrands?: Brand[]
   simulation?: Simulation
@@ -339,6 +346,8 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
   if (p.hasCredentials) {
     add('credentials', 'warning', `The link hides its real destination: browsers ignore "${p.credentialText}@" and go to ${p.hostname}.`)
   }
+  if (!p.isIp && isPrivateAddress(p.hostname)) add('private-host', 'warning', 'This is a local or internal network name, not a public payment destination.')
+  if (/\.(example|invalid|test|localhost)$/.test(p.hostname) || /^(example\.(com|net|org))$/.test(p.hostname)) add('reserved-domain', 'caution', 'This is a reserved example or test address, not a real public merchant.')
   if (p.isIp) {
     if (isPrivateAddress(p.hostname)) add('private-ip', 'warning', 'The link points to a private network address, not a public business website.')
     else add('ip', 'warning', 'The link goes to a bare server number instead of a named website. Real checkouts don\'t do this.')
@@ -359,10 +368,11 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
   if (brand.official) {
     add('official', 'positive', `${site} is an official ${brand.official.name} domain (BeforePay reference list).`)
   }
-  if (brand.impersonation) add('impersonation', 'warning', brand.impersonation.detail)
+  if (brand.impersonation) add(brand.impersonation.strength === 'similarity' ? 'brand-similarity' : 'impersonation', brand.impersonation.strength === 'similarity' ? 'caution' : 'warning', brand.impersonation.detail)
 
   if (processor) {
-    if (processor.kind === 'crypto') add('crypto', 'warning', processor.note)
+    if (processor.kind === 'crypto') add('crypto', 'caution', processor.note)
+    else if (processor.kind === 'platform') add('platform', 'caution', 'This is a shared commerce platform. The independent shop and recipient are not verified.')
     else if (processor.kind === 'p2p') add('p2p', 'caution', processor.note)
     else add('processor', 'positive', `This is ${processor.name}'s official payment domain.`)
   }
@@ -374,14 +384,20 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
   }
 
   /* ---- Domain registration (RDAP) ---- */
-  const rdap = externals.rdap
+  const rawRdap = externals.rdap
+  const registeredTime = Date.parse(rawRdap.registered ?? '')
+  const rdap = rawRdap.status === 'ok' && (!Number.isFinite(registeredTime) || registeredTime > now.getTime())
+    ? { status: 'unavailable' as const, reason: 'registry returned an invalid registration date' } : rawRdap
   let ageDays: number | null = null
   if (rdap.status === 'ok' && rdap.registered) {
     ageDays = daysBetween(rdap.registered, now)
-    if (ageDays < 30) add('new-domain', 'warning', `${site} was registered ${ageInWords(ageDays)}. Brand-new sites are a common sign of payment scams.`)
+    if (ageDays < 30) add('new-domain', 'caution', `${site} was registered ${ageInWords(ageDays)}. Brand-new sites are a common sign of payment scams.`)
     else if (ageDays < 180) add('young-domain', 'caution', `${site} was registered ${ageInWords(ageDays)} — a fairly new website.`)
     else if (ageDays >= 365) add('established', 'positive', `${site} has been registered since ${new Date(rdap.registered).getUTCFullYear()}.`)
   }
+
+  if (externals.dns?.status === 'not_found') add('dns-missing', 'caution', 'The hostname did not resolve in public DNS at the time of this check. It may be inactive or mistyped; this alone does not prove fraud.')
+  if (externals.dns?.addresses?.some((a) => isPrivateAddress(a))) add('private-dns', 'warning', 'Public DNS points this hostname to a private network address. It is not a normal public payment destination.')
 
   /* ---- Threat intelligence ---- */
   const threat = externals.threat
@@ -420,20 +436,23 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
     if (expectedBrand) {
       if (isOfficialFor(expectedBrand, p.hostname)) {
         expectedRow = row('expected', 'Match with who you expected to pay', 'pass', `This is an official ${expectedBrand.name} address, consistent with who you expected.`, [`${p.hostname} is listed for ${expectedBrand.name}: ${expectedBrand.official.join(', ')}`])
-      } else if (processor && processor.kind === 'hosted' && expectedBrand.official.includes(processor.name.toLowerCase() + '.com')) {
+      } else if (processor && processor.kind === 'hosted' && expectedBrand.name === processor.name) {
         expectedRow = row('expected', 'Match with who you expected to pay', 'pass', `This is ${processor.name}'s own checkout.`, [])
+      } else if (processor && (processor.kind === 'hosted' || processor.kind === 'platform')) {
+        add('expected-unlinked', 'caution', `The address identifies ${processor.name}, but cannot establish whether the merchant is ${expectedBrand.name}.`)
+        expectedRow = row('expected', 'Match with who you expected to pay', 'caution', `A ${processor.name} payment page can serve many businesses. We cannot link this account to ${expectedBrand.name} from the URL.`, [`Provider: ${processor.name}`, `Expected merchant: ${expectedBrand.name}`, 'Ask the merchant through a channel you already trust.'])
       } else {
         add('expected-mismatch', 'warning', `You expected to pay ${expectedBrand.name}, but this link goes to ${site}, which is not a ${expectedBrand.name} address.`)
         expectedRow = row('expected', 'Match with who you expected to pay', 'fail', `You expected ${expectedBrand.name}. This link goes to ${site}, which ${expectedBrand.name} doesn't use.`, [`${expectedBrand.name}'s domains on our reference list: ${expectedBrand.official.join(', ')}`, `Destination: ${p.hostname}`])
       }
     } else if (mentioned.length) {
-      expectedRow = row('expected', 'Match with who you expected to pay', 'pass', `The address mentions "${mentioned[0]}", which fits ${expected}. Anyone can register a name, so this is consistent — not proof.`, [`Matched word: ${mentioned.join(', ')}`, `Destination: ${p.hostname}`])
-      expectedRow.status = 'pass'
+      expectedRow = row('expected', 'Match with who you expected to pay', 'info', `The address mentions "${mentioned[0]}", which fits ${expected}. Anyone can register a name, so this is consistent — not proof.`, [`Matched word: ${mentioned.join(', ')}`, `Destination: ${p.hostname}`])
+      add('expected-name-only', 'caution', 'A matching word in the address does not verify the merchant.')
     } else if (processor && processor.kind === 'hosted') {
       expectedRow = row(
         'expected',
         'Match with who you expected to pay',
-        shotMatches ? 'pass' : 'info',
+        shotMatches ? 'info' : 'caution',
         shotMatches
           ? `The payment runs through ${processor.name}, and the page shows "${shot?.visibleMerchant}", which fits ${expected}.`
           : `The payment runs through ${processor.name}, so ${expected}'s name won't appear in the address. Check the business name shown on the payment page.`,
@@ -446,13 +465,13 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
   }
 
   /* ---- Verdict ---- */
+  const contextEvidence = contextChecks(opts.context)
+  signals.push(...contextEvidence.signals)
   const warnings = signals.filter((s) => s.severity === 'warning')
   const cautions = signals.filter((s) => s.severity === 'caution')
   const corroborated =
     Boolean(brand.official) ||
-    Boolean(processor && processor.kind === 'hosted') ||
-    (ageDays !== null && ageDays >= 365) ||
-    threat.status === 'clean'
+    Boolean(processor && processor.kind === 'hosted')
   const verdict: Verdict = warnings.length ? 'warning' : corroborated && cautions.length === 0 ? 'clear' : 'unverified'
 
   /* ---- Evidence rows ---- */
@@ -468,13 +487,21 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
   const { fields, chain } = identity(p, rdap, brand, processor, shot, expected, now)
 
   /* ---- Words ---- */
+  const criteria = buildCriteria({ p, rdap, ageDays, brand, processor, expectedRow, signals, threat, dns: externals.dns, shot, simulated: externals.simulated })
+  criteria.push(...contextEvidence.criteria)
   const copy = compose(verdict, signals, { p, site, processor, brand, expected, source: opts.source, shot })
+  if (verdict !== 'warning' && contextEvidence.signals.length) {
+    copy.explanation = contextEvidence.signals[0].text + ' The destination does not establish who receives the money.'
+    copy.nextStep = { title: opts.context?.channel === 'marketplace' ? 'Keep the payment in the marketplace' : 'Confirm the request through a trusted channel', body: 'Open the original app or contact the person using details you already trust. Confirm the recipient, amount and available buyer protection before paying.' }
+  }
 
   const notChecked: string[] = []
   if (threat.status !== 'clean' && threat.status !== 'flagged') notChecked.push(threat.status === 'not_configured' ? 'Phishing and malware databases (no threat-intelligence service configured on this deployment)' : 'Phishing and malware databases (lookup unavailable right now)')
+  if (!externals.dns || externals.dns.status === 'unavailable' || externals.dns.status === 'skipped') notChecked.push('Public DNS availability (no usable lookup for this destination)')
   if (rdap.status !== 'ok') notChecked.push('Domain registration date (registry lookup unavailable)')
   notChecked.push("The payment page's content — BeforePay never opens the page")
   notChecked.push('Who ultimately receives the money')
+  notChecked.push('TLS certificate validity, redirects and website content (the address is not visited)')
   if (!opts.expected) notChecked.push('Whether this matches who you meant to pay')
 
   return {
@@ -489,9 +516,13 @@ export function analyze(url: URL, externals: Externals, opts: AnalyzeOptions): R
     chain,
     evidence,
     signals,
+    criteria,
+    engineVersion: ENGINE_VERSION,
+    dns: externals.dns,
     notChecked,
     checkedAt: now.toISOString(),
     expected,
+    context: opts.context ? { channel: opts.context.channel, method: opts.context.method, amount: opts.context.amount?.slice(0, 40) } : undefined,
     screenshot: shot,
     registry: externals.registry,
     simulation: opts.simulation,
@@ -534,8 +565,8 @@ function domainRow(
 
   let status: Status = 'info'
   let summary = `This link belongs to ${site}.`
-  const bad = ['credentials', 'ip', 'private-ip', 'new-domain'].map(has).find(Boolean)
-  const meh = ['young-domain', 'shared-hosting', 'shortener', 'http', 'port', 'idn'].map(has).find(Boolean)
+  const bad = ['credentials', 'ip', 'private-ip', 'private-host', 'private-dns'].map(has).find(Boolean)
+  const meh = ['new-domain', 'dns-missing', 'reserved-domain', 'young-domain', 'shared-hosting', 'shortener', 'http', 'port', 'idn'].map(has).find(Boolean)
   if (bad) {
     status = 'fail'
     summary = bad.text
@@ -568,7 +599,7 @@ function reputationRow(threat: Externals['threat'], simulated?: boolean): Eviden
     case 'clean':
       return { ...base, status: 'pass', summary: `Not listed by ${threat.source?.label ?? 'the threat database'}. New scam sites often aren't listed yet.`, details: ['Checked: malware, social engineering (phishing), unwanted software', 'A clean result only means the link is not on a known list.'] }
     case 'not_configured':
-      return { ...base, status: 'not_checked', summary: 'Not checked — no threat-intelligence service is configured on this deployment.', details: ['Set GOOGLE_SAFE_BROWSING_KEY on the server to enable Google Safe Browsing lookups.'] }
+      return { ...base, status: 'not_checked', summary: 'Not checked — no threat-intelligence service is configured on this deployment.', details: ['No external threat-feed result contributed to this report. Local address checks still run.'] }
     case 'offline':
       return { ...base, status: 'not_checked', summary: "Not checked — you're offline.", details: [] }
     default:
@@ -583,7 +614,7 @@ function impersonationRow(brand: BrandResult, p: ParsedUrl): EvidenceRow {
     return {
       id: 'impersonation',
       title: 'Brand impersonation',
-      status: 'fail',
+      status: brand.impersonation.strength === 'similarity' ? 'caution' : 'fail',
       summary: brand.impersonation.detail,
       details: [
         `Technique: ${{ 'subdomain-trick': 'real brand domain used as a subdomain', homoglyph: 'look-alike international characters', name: 'brand name inside an unrelated domain', lookalike: 'look-alike spelling', 'tld-swap': 'same name, different domain ending' }[brand.impersonation.how]}`,
@@ -614,7 +645,7 @@ function contentRow(shot: ScreenshotFindings): EvidenceRow {
   for (const s of shot.suspicious) details.push(`Flagged wording: ${s}`)
   if (shot.summary) details.push(shot.summary)
   const status: Status = shot.offPlatformRequest ? 'fail' : shot.suspicious.length ? 'caution' : 'info'
-  const summary = shot.offPlatformRequest
+  const summary = shot.readingMethod === 'local_ocr' ? 'A link was read locally. The rest of the screenshot has not been analysed.' : shot.offPlatformRequest
     ? 'Asks you to pay outside the platform — a classic way to remove buyer protection.'
     : shot.suspicious.length
       ? shot.suspicious[0]
@@ -625,9 +656,9 @@ function contentRow(shot: ScreenshotFindings): EvidenceRow {
     status,
     summary,
     details,
-    sources: [{ label: shot.simulated ? 'Scenario fixture (simulated)' : 'Read from your screenshot by AI — may contain mistakes' }],
+    sources: [{ label: shot.simulated ? 'Scenario fixture (simulated)' : shot.readingMethod === 'local_ocr' ? 'Read on your device — may contain reading errors' : 'Read from your screenshot by AI — may contain mistakes' }],
     simulated: shot.simulated,
-    aiAssisted: !shot.simulated,
+    aiAssisted: !shot.simulated && shot.readingMethod !== 'local_ocr',
   }
 }
 
@@ -651,7 +682,7 @@ function identity(
   ]
   if (processor?.handle) {
     fields.push({ key: 'merchant', label: 'Apparent merchant', value: `@${processor.handle}`, assurance: 'inferred', note: `${processor.name} account handle from the link; the person or business behind it is unknown`, mono: true })
-  } else if (brand.official) {
+  } else if (brand.official && !processor) {
     fields.push({ key: 'merchant', label: 'Apparent merchant', value: brand.official.name, assurance: 'verified', note: 'Official domain on our reference list', source: { label: 'BeforePay brand reference list' } })
   } else if (shot?.visibleMerchant) {
     fields.push({ key: 'merchant', label: 'Apparent merchant', value: shot.visibleMerchant, assurance: 'inferred', note: shot.simulated ? 'Name shown in the scenario — anyone can type any name' : 'Name visible on your screenshot — anyone can type any name' })
@@ -702,7 +733,7 @@ function identity(
     {
       role: 'website',
       label: 'Website owner',
-      value: brand.official ? brand.official.name : processor && processor.kind !== 'p2p' ? processor.name : null,
+      value: brand.official ? brand.official.name : processor ? processor.name : null,
       assurance: brand.official || processor ? 'verified' : 'not_verified',
       note: brand.official
         ? `${site} is ${brand.official.name}'s domain`
@@ -728,7 +759,7 @@ function identity(
     },
     { role: 'recipient', label: 'Actual recipient', value: null, assurance: 'not_verified', note: recipientNote },
   ]
-  if (brand.official && !processor?.handle) chain[1].assurance = 'verified'
+  if (brand.official && !processor) chain[1].assurance = 'verified'
   return { fields, chain }
 }
 
@@ -777,8 +808,8 @@ function compose(verdict: Verdict, signals: Signal[], c: ComposeCtx): Pick<Repor
 
   if (verdict === 'clear') {
     let explanation = `None of our checks found warning signs for ${c.site}. That's not a guarantee, and we couldn't confirm who receives the money.`
-    if (c.processor?.kind === 'hosted') explanation = `This is a genuine ${c.processor.name} checkout page and none of our checks found warning signs. ${c.processor.name} doesn't show us who the merchant is.`
-    else if (c.brand.official) explanation = `This is ${c.brand.official.name}'s own website and none of our checks found warning signs. That's not a guarantee.`
+    if (c.processor?.kind === 'hosted') explanation = `The address matches ${c.processor.name}'s hosted checkout domains and none of our checks found warning signs. ${c.processor.name} doesn't show us who the merchant is.`
+    else if (c.brand.official) explanation = `The address matches ${c.brand.official.name}'s reference domain and none of our checks found warning signs. That's not a guarantee.`
     return {
       headline,
       explanation,
@@ -789,6 +820,9 @@ function compose(verdict: Verdict, signals: Signal[], c: ComposeCtx): Pick<Repor
   }
 
   // unverified
+  if (has('new-domain') || has('young-domain')) return { headline, explanation: `${text(has('new-domain') ? 'new-domain' : 'young-domain')} A new registration is a reason to check further, not proof of fraud.`, nextStep: { title: 'Verify the business independently', body: 'Use contact details from a source you already trust. Check the business and buyer protection before paying.' } }
+  if (has('brand-similarity')) return { headline, explanation: text('brand-similarity'), nextStep: { title: 'Check the spelling with the sender', body: 'Similar names can belong to unrelated businesses. Find the business independently and compare the exact domain.' } }
+  if (has('crypto')) return { headline, explanation: 'This is a recognised cryptocurrency payment provider, but the merchant and final recipient are not verified. Crypto payments are difficult to reverse.', nextStep: { title: 'Confirm the recipient before paying', body: 'Ask for a payment method with buyer protection if you are buying from someone you do not know.' } }
   if (has('expected-unlinked')) {
     return {
       headline,

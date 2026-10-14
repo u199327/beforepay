@@ -93,17 +93,17 @@ const PROCESSORS: ProcessorRule[] = [
   { name: 'GoCardless', kind: 'hosted', hosts: ['pay.gocardless.com'], note: 'A GoCardless Direct Debit page. It sets up payments from your bank account to the merchant.' },
   { name: 'Mollie', kind: 'hosted', hosts: ['www.mollie.com', 'mollie.com', 'paymentlink.mollie.com'], paths: /^\/(checkout|paymentscreen|p\/)/i, note: 'A Mollie-hosted payment page. The merchant is not visible from the address.' },
   { name: 'Klarna', kind: 'hosted', hosts: ['pay.klarna.com', 'js.klarna.com'], note: 'A Klarna payment page. Klarna is a lender: you may owe Klarna, not the shop.' },
-  { name: 'Cash App', kind: 'p2p', domains: ['cash.app'], handleFromPath: true, note: 'A Cash App link pays whoever owns this $cashtag. Payments are usually instant and hard to reverse.' },
+  { name: 'Cash App', kind: 'p2p', domains: ['cash.app'], paths: /^\/[$]/, handleFromPath: true, note: 'A Cash App link pays whoever owns this $cashtag. Payments are usually instant and hard to reverse.' },
   { name: 'Venmo', kind: 'p2p', domains: ['venmo.com'], paths: /^\/(u\/|code)/i, handleFromPath: true, note: 'A Venmo link pays a personal account. Purchase protection only applies to payments marked as goods and services.' },
   { name: 'Razorpay', kind: 'hosted', domains: ['rzp.io', 'razorpay.me'], hosts: ['pages.razorpay.com'], note: 'A Razorpay payment page. The merchant is not visible from the address.' },
   { name: 'Paddle', kind: 'hosted', hosts: ['checkout.paddle.com', 'buy.paddle.com', 'pay.paddle.io'], note: 'A Paddle checkout. Paddle acts as reseller (merchant of record) for the software vendor.' },
   { name: 'Coinbase Commerce', kind: 'crypto', hosts: ['commerce.coinbase.com'], note: 'A cryptocurrency payment page. Crypto payments cannot be reversed and have no buyer protection.' },
 ]
 
-export function matchProcessor(hostname: string, registrable: string | null, pathname: string): ProcessorMatch | null {
+export function matchProcessor(hostname: string, _registrable: string | null, pathname: string): ProcessorMatch | null {
   for (const rule of PROCESSORS) {
     const hostHit = rule.hosts?.includes(hostname) ?? false
-    const domainHit = registrable ? rule.domains?.includes(registrable) ?? false : false
+    const domainHit = rule.domains?.some(d => hostname === d || hostname.endsWith(`.${d}`)) ?? false
     if (!hostHit && !domainHit) continue
     if (rule.paths && !rule.paths.test(pathname)) continue
     let handle: string | undefined

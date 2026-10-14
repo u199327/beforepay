@@ -10,6 +10,7 @@ function vcardName(e: RdapEntity): string | undefined {
 
 /** Reduce an RDAP domain response to the few facts BeforePay shows. Shared by browser and server. */
 export function summariseRdap(raw: unknown): RdapInfo {
+  if (!raw || typeof raw !== 'object') return { status: 'unavailable', reason: 'invalid registry response' }
   const doc = raw as RdapDoc
   const ev = (a: string) => doc.events?.find((e) => e.eventAction === a)?.eventDate
   const registrar = doc.entities?.find((e) => e.roles?.includes('registrar'))
@@ -19,7 +20,8 @@ export function summariseRdap(raw: unknown): RdapInfo {
     !registrantName ||
     /redact|privacy|withheld|proxy|not disclosed|data protected/i.test(registrantName) ||
     Boolean(registrant?.remarks?.some((r) => /redact/i.test(r.title ?? '')))
-  const registered = ev('registration')
+  const candidate = ev('registration')
+  const registered = candidate && Number.isFinite(Date.parse(candidate)) && Date.parse(candidate) <= Date.now() ? candidate : undefined
   return {
     status: registered ? 'ok' : 'unavailable',
     registered,

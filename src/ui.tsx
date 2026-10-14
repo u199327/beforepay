@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import { Check, CircleDashed, Info, Minus, TriangleAlert, X } from 'lucide-react'
 import type { Assurance, ParsedUrl, Status } from './engine/types'
 import { HIDDEN } from './lib/ingest'
@@ -96,10 +96,30 @@ export function UrlAnatomy({ url, lit = 4, dark = false, compact = false }: { ur
 }
 
 export function Sheet({ open, onClose, title, children, dark = false }: { open: boolean; onClose: () => void; title: string; children: ReactNode; dark?: boolean }) {
+  const dialog = useRef<HTMLDivElement>(null)
+  const close = useRef(onClose)
+  close.current = onClose
+  useEffect(() => {
+    if (!open) return
+    const previous = document.activeElement as HTMLElement | null
+    const overflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const frame = requestAnimationFrame(() => dialog.current?.querySelector<HTMLButtonElement>('button:not([aria-hidden="true"])')?.focus())
+    const keys = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); close.current(); return }
+      if (event.key !== 'Tab') return
+      const items = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not([disabled]):not([aria-hidden="true"]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex="0"]') ?? [])].filter(el => el.getClientRects().length > 0 && !el.closest('details:not([open])'))
+      const first = items[0]; const last = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+    }
+    document.addEventListener('keydown', keys)
+    return () => { cancelAnimationFrame(frame); document.removeEventListener('keydown', keys); document.body.style.overflow = overflow; if (previous?.isConnected) previous.focus() }
+  }, [open])
   if (!open) return null
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" role="dialog" aria-modal="true" aria-label={title}>
-      <button className="absolute inset-0 bg-ink/55 backdrop-blur-[2px]" aria-label="Close" onClick={onClose} />
+    <div ref={dialog} className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" role="dialog" aria-modal="true" aria-label={title}>
+      <button className="absolute inset-0 bg-ink/55 backdrop-blur-[2px]" aria-label="Close" aria-hidden="true" tabIndex={-1} onClick={onClose} />
       <div
         className={`rise relative max-h-[92dvh] w-full overflow-y-auto rounded-t-[28px] sm:max-w-[560px] sm:rounded-[28px] ${dark ? 'on-dark bg-ink text-paper' : 'bg-paper text-ink'} safe-bottom px-5 pt-5 sm:px-8 sm:pt-7`}
       >
